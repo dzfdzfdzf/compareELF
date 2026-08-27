@@ -1,24 +1,27 @@
 # compareELF
 
-比较同一套源码分别通过 Make 和 Bazel 构建得到的两个 ELF，输出精简的语义差异 summary JSON。
+`compareELF` compares ELF artifacts built from the same source by Make and Bazel and writes a compact semantic-difference summary as JSON. It does not require byte-for-byte equality and does not compare machine instructions inside matched functions.
 
-工具只判断约定的 ELF 运行契约、符号、函数清单、启动/退出回调、安全属性和 ABI 是否一致，不要求两个文件字节完全相同，也不比较已配对函数的机器指令。
+## Files
 
-## 运行要求
+`elfcompare.py` is the command-line entry point and contains the native ELF parser.  
+`elfcompare_tools.py` runs supporting tools, performs semantic comparisons, and builds the summary JSON.
+
+## Requirements
 
 - Python 3
 - GNU `readelf`
-- `abidiff`：比较共享库时用于检查函数签名和类型布局
+- `abidiff` for shared-library function-signature and type-layout checks
 
-## 对比命令
+## Usage
 
-第一个参数是 Make 产物，第二个参数是 Bazel 产物：
+The first argument is the Make artifact and the second is the Bazel artifact:
 
 ```bash
 python3 elfcompare.py path/to/make.elf path/to/bazel.elf
 ```
 
-保存 summary：
+Save the summary to a file:
 
 ```bash
 python3 elfcompare.py path/to/make.elf path/to/bazel.elf > summary.json
@@ -26,7 +29,7 @@ python3 elfcompare.py path/to/make.elf path/to/bazel.elf > summary.json
 
 ## Summary JSON
 
-没有发现语义差异时：
+When no semantic difference is found:
 
 ```json
 {
@@ -36,7 +39,7 @@ python3 elfcompare.py path/to/make.elf path/to/bazel.elf > summary.json
 }
 ```
 
-发现语义差异时：
+When differences are found:
 
 ```json
 {
@@ -67,51 +70,51 @@ python3 elfcompare.py path/to/make.elf path/to/bazel.elf > summary.json
 }
 ```
 
-字段含义：
+### Fields
 
-| 字段 | 含义 |
+| Field | Meaning |
 |---|---|
-| `make` | Make 产物的绝对路径 |
-| `bazel` | Bazel 产物的绝对路径 |
-| `compiler_version_mismatch` | 可选；两侧 `.comment` 中的编译器/汇编器版本字符串不同，仅用于解释差异，不单独判失败 |
-| `findings` | 已确认的语义差异列表 |
-| `category` | 差异类型 |
-| `section` | 差异的主要 ELF 证据位置；动态表统一写成 `.dynamic` |
-| `name` | 发生变化的属性、符号、函数或回调 |
-| `left` | Make 侧的值 |
-| `right` | Bazel 侧的值 |
-| `detail` | 可选的差异说明 |
+| `make` | Absolute path of the Make artifact |
+| `bazel` | Absolute path of the Bazel artifact |
+| `compiler_version_mismatch` | Optional `.comment` compiler/assembler strings; explanatory only and not a semantic failure by itself |
+| `findings` | Confirmed semantic differences |
+| `category` | Difference category |
+| `section` | Primary ELF evidence location; the dynamic table is reported as `.dynamic` |
+| `name` | Changed property, symbol, function, or callback |
+| `left` | Make-side value |
+| `right` | Bazel-side value |
+| `detail` | Optional explanation |
 
-`left` 永远表示 Make，`right` 永远表示 Bazel。
+`left` always means Make and `right` always means Bazel.
 
-## Category
+## Categories
 
-| Category | 代表什么 |
+| Category | Meaning |
 |---|---|
-| `elf` | ELF 基础格式契约不同，例如 Class、Data、Machine、Type、OS/ABI、ABI Version 或 Flags 不同 |
-| `runtime` | loader 或 TLS 运行契约不同，例如 program interpreter 或 TLS 属性不同 |
-| `dependency` | `.dynamic` 中的 `DT_NEEDED`、SONAME、RPATH、RUNPATH 或动态 flags 不同 |
-| `import-added` | Bazel 新增动态导入符号，即新增了运行时外部符号依赖 |
-| `import-removed` | Make 存在的动态导入符号在 Bazel 中消失；`*_chk`、`__stack_chk_fail` 等变化也归在这里，不重复输出 security |
-| `import-changed` | 同名动态导入符号的 type、binding、visibility 或版本化身份不同 |
-| `export-added` | Bazel 新增非 WEAK 动态导出符号 |
-| `export-removed` | Make 对外提供的动态导出符号在 Bazel 中消失 |
-| `export-changed` | 同名动态导出符号的 type、binding、visibility、定义状态或对象大小不同 |
-| `runtime-version` | Bazel 提高或新增运行时符号版本要求，例如从 `GLIBC_2.17` 提高到 `GLIBC_2.38` |
-| `function-added` | `readelf -sW` 能稳定识别的普通非 WEAK 函数只存在于 Bazel |
-| `function-removed` | `readelf -sW` 能稳定识别的普通函数只存在于 Make |
-| `startup-callback` | `.preinit_array`、`.init_array` 或 `.fini_array` 的回调数量、函数或顺序不同 |
-| `runtime-data` | 被工具纳入语义比较的运行时数据内容不同 |
-| `security` | 直接安全属性降低或发生不可安全分类的变化，例如 BIND_NOW、GNU_STACK、RELRO、IBT、SHSTK、BTI 或 PAC；不会根据符号名重复推断 security |
-| `abi` | `abidiff` 发现同名导出接口的函数签名或结构体/类类型布局不同；单纯 export 增删不重复输出 ABI |
+| `elf` | Base ELF contract changed, such as Class, Data, Machine, Type, OS/ABI, ABI Version, or Flags |
+| `runtime` | Loader or TLS runtime contract changed, such as the program interpreter or TLS properties |
+| `dependency` | `.dynamic` dependencies, SONAME, RPATH, RUNPATH, or dynamic flags changed |
+| `import-added` | Bazel adds a dynamic imported symbol and therefore a runtime symbol dependency |
+| `import-removed` | A Make dynamic import is absent from Bazel; changes involving `*_chk` or `__stack_chk_fail` remain import findings and are not duplicated as security findings |
+| `import-changed` | Type, binding, visibility, or versioned identity of a dynamic import changed |
+| `export-added` | Bazel adds a non-WEAK dynamic export |
+| `export-removed` | A dynamic export provided by Make is absent from Bazel |
+| `export-changed` | Type, binding, visibility, definition state, or object size of a dynamic export changed |
+| `runtime-version` | Bazel raises or adds a runtime symbol-version requirement, for example from `GLIBC_2.17` to `GLIBC_2.38` |
+| `function-added` | An ordinary non-WEAK function identifiable by `readelf -sW` exists only in Bazel |
+| `function-removed` | An ordinary function identifiable by `readelf -sW` exists only in Make |
+| `startup-callback` | Callback count, identity, or order differs in `.preinit_array`, `.init_array`, or `.fini_array` |
+| `runtime-data` | Runtime data included in semantic comparison differs |
+| `security` | A direct hardening property regressed or changed ambiguously, such as BIND_NOW, GNU_STACK, RELRO, IBT, SHSTK, BTI, or PAC |
+| `abi` | `abidiff` reports a function-signature or structure/class layout change; pure export additions/removals are not duplicated here |
 
-## 退出码
+## Exit Codes
 
-| 退出码 | 含义 |
+| Code | Meaning |
 |---:|---|
-| `0` | 已完成的检查没有发现语义差异 |
-| `1` | 发现语义差异 |
-| `2` | 输入文件无效、无法读取或不是受支持的 ELF |
-| `3` | 必需工具缺失、外部工具失败、两侧 strip 状态不一致或证据不足，不能判定一致 |
+| `0` | Completed checks found no semantic difference |
+| `1` | A semantic difference was found |
+| `2` | An input cannot be read, is invalid, or is not a supported ELF |
+| `3` | A required tool failed or evidence is insufficient, including asymmetric stripping |
 
-CI 中退出码 `1` 和 `3` 都不应作为通过。
+CI should reject both exit code `1` and exit code `3`.
