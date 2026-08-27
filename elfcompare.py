@@ -1,11 +1,9 @@
 #!/usr/bin/env python3
-"""Compare two ELF artifacts byte-for-byte or by a normalized ELF view."""
+"""Parse two ELF artifacts and emit their semantic-difference summary."""
 
 from __future__ import annotations
 
 import argparse
-import fnmatch
-import hashlib
 import os
 import struct
 import sys
@@ -13,11 +11,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 
-VERSION = "3.0.0"
-EXIT_EQUAL = 0
-EXIT_DIFFERENT = 1
 EXIT_ERROR = 2
-EXIT_INCOMPLETE = 3
 
 ELF_MAGIC = b"\x7fELF"
 ELFCLASS32 = 1
@@ -33,9 +27,6 @@ SHT_RELA = 4
 SHT_REL = 9
 SHN_UNDEF = 0
 SHN_LORESERVE = 0xFF00
-STT_OBJECT = 1
-STT_FUNC = 2
-STT_TLS = 6
 
 DEFAULT_IGNORED_SECTIONS = (
     ".comment",
@@ -48,61 +39,6 @@ DEFAULT_IGNORED_SECTIONS = (
     ".zdebug*",
     ".gdb_index",
 )
-
-ELF_TYPES = {
-    0: "NONE",
-    1: "REL",
-    2: "EXEC",
-    3: "DYN",
-    4: "CORE",
-}
-
-MACHINES = {
-    0: "NONE",
-    3: "x86",
-    8: "MIPS",
-    20: "PowerPC",
-    21: "PowerPC64",
-    40: "ARM",
-    62: "x86-64",
-    183: "AArch64",
-    243: "RISC-V",
-}
-
-SECTION_TYPES = {
-    0: "NULL",
-    1: "PROGBITS",
-    2: "SYMTAB",
-    3: "STRTAB",
-    4: "RELA",
-    5: "HASH",
-    6: "DYNAMIC",
-    7: "NOTE",
-    8: "NOBITS",
-    9: "REL",
-    11: "DYNSYM",
-    14: "INIT_ARRAY",
-    15: "FINI_ARRAY",
-    16: "PREINIT_ARRAY",
-    17: "GROUP",
-    18: "SYMTAB_SHNDX",
-}
-
-PROGRAM_TYPES = {
-    0: "NULL",
-    1: "LOAD",
-    2: "DYNAMIC",
-    3: "INTERP",
-    4: "NOTE",
-    5: "SHLIB",
-    6: "PHDR",
-    7: "TLS",
-    0x6474E550: "GNU_EH_FRAME",
-    0x6474E551: "GNU_STACK",
-    0x6474E552: "GNU_RELRO",
-    0x6474E553: "GNU_PROPERTY",
-}
-
 
 class ElfError(ValueError):
     pass
@@ -170,22 +106,6 @@ class Relocation:
     addend: Optional[int]
 
 
-@dataclass(frozen=True)
-class Difference:
-    category: str
-    path: str
-    left: Any
-    right: Any
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "category": self.category,
-            "path": self.path,
-            "left": self.left,
-            "right": self.right,
-        }
-
-
 class ElfFile:
     """A bounds-checked ELF header, program-header and section-table parser."""
 
@@ -197,7 +117,6 @@ class ElfFile:
         except OSError as exc:
             raise ElfError(f"cannot read {path!r}: {exc}") from exc
 
-        self.sha256 = hashlib.sha256(self.data).hexdigest()
         self._parse_header()
         self._parse_tables()
 
@@ -468,235 +387,6 @@ class ElfFile:
         return "little" if self.data_encoding == ELFDATA2LSB else "big"
 
 
-def _format_enum(value: int, names: Dict[int, str]) -> str:
-    return f"{names.get(value, 'UNKNOWN')} (0x{value:x})"
-
-
-def _is_ignored(name: str, patterns: Sequence[str]) -> bool:
-    return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
-
-
-def _numbered_sections(elf: ElfFile, patterns: Sequence[str]) -> Dict[Tuple[str, int], Section]:
-    result: Dict[Tuple[str, int], Section] = {}
-    occurrences: Dict[str, int] = {}
-    for section in elf.sections:
-        if section.index == 0 or _is_ignored(section.name, patterns):
-            continue
-        occurrence = occurrences.get(section.name, 0)
-        occurrences[section.name] = occurrence + 1
-        result[(section.name, occurrence)] = section
-    return result
-
-
-def _section_label(key: Tuple[str, int]) -> str:
-    name, occurrence = key
-    return name if occurrence == 0 else f"{name}#{occurrence + 1}"
-
-
-def _link_name(elf: ElfFile, index: int) -> Any:
-    if index == 0:
-        return 0
-    if index < len(elf.sections):
-        return elf.sections[index].name
-    return f"<invalid:{index}>"
-
-
-def semantic_differences(
-    left: ElfFile, right: ElfFile, ignored_patterns: Sequence[str]
-) -> List[Difference]:
-    differences: List[Difference] = []
-
-    header_fields = (
-        ("class", left.display_class, right.display_class),
-        ("endianness", left.display_endian, right.display_endian),
-        ("ident_version", left.ident_version, right.ident_version),
-        ("osabi", left.osabi, right.osabi),
-        ("abi_version", left.abi_version, right.abi_version),
-        ("type", _format_enum(left.type, ELF_TYPES), _format_enum(right.type, ELF_TYPES)),
-        (
-            "machine",
-            _format_enum(left.machine, MACHINES),
-            _format_enum(right.machine, MACHINES),
-        ),
-        ("version", left.version, right.version),
-        ("entry", f"0x{left.entry:x}", f"0x{right.entry:x}"),
-        ("flags", f"0x{left.flags:x}", f"0x{right.flags:x}"),
-    )
-    for name, left_value, right_value in header_fields:
-        if left_value != right_value:
-            differences.append(Difference("header", name, left_value, right_value))
-
-    left_programs = left.program_headers
-    right_programs = right.program_headers
-    if len(left_programs) != len(right_programs):
-        differences.append(
-            Difference("program_headers", "count", len(left_programs), len(right_programs))
-        )
-    for index, (left_ph, right_ph) in enumerate(zip(left_programs, right_programs)):
-        fields = (
-            ("type", _format_enum(left_ph.type, PROGRAM_TYPES), _format_enum(right_ph.type, PROGRAM_TYPES)),
-            ("flags", f"0x{left_ph.flags:x}", f"0x{right_ph.flags:x}"),
-            ("vaddr", f"0x{left_ph.vaddr:x}", f"0x{right_ph.vaddr:x}"),
-            ("paddr", f"0x{left_ph.paddr:x}", f"0x{right_ph.paddr:x}"),
-            ("filesz", left_ph.filesz, right_ph.filesz),
-            ("memsz", left_ph.memsz, right_ph.memsz),
-            ("align", left_ph.align, right_ph.align),
-        )
-        for name, left_value, right_value in fields:
-            if left_value != right_value:
-                differences.append(
-                    Difference("program_header", f"[{index}].{name}", left_value, right_value)
-                )
-
-    left_sections = _numbered_sections(left, ignored_patterns)
-    right_sections = _numbered_sections(right, ignored_patterns)
-    all_keys = sorted(set(left_sections) | set(right_sections))
-    for key in all_keys:
-        label = _section_label(key)
-        left_section = left_sections.get(key)
-        right_section = right_sections.get(key)
-        if left_section is None:
-            differences.append(Difference("section", label, "<missing>", "<present>"))
-            continue
-        if right_section is None:
-            differences.append(Difference("section", label, "<present>", "<missing>"))
-            continue
-
-        section_fields = (
-            (
-                "type",
-                _format_enum(left_section.type, SECTION_TYPES),
-                _format_enum(right_section.type, SECTION_TYPES),
-            ),
-            ("flags", f"0x{left_section.flags:x}", f"0x{right_section.flags:x}"),
-            ("addr", f"0x{left_section.addr:x}", f"0x{right_section.addr:x}"),
-            ("size", left_section.size, right_section.size),
-            ("link", _link_name(left, left_section.link), _link_name(right, right_section.link)),
-            ("addralign", left_section.addralign, right_section.addralign),
-            ("entsize", left_section.entsize, right_section.entsize),
-        )
-        if left_section.type in (SHT_REL, SHT_RELA):
-            section_fields += (("info", _link_name(left, left_section.info), _link_name(right, right_section.info)),)
-        else:
-            section_fields += (("info", left_section.info, right_section.info),)
-
-        for name, left_value, right_value in section_fields:
-            if left_value != right_value:
-                differences.append(
-                    Difference("section", f"{label}.{name}", left_value, right_value)
-                )
-
-        left_digest = hashlib.sha256(left.section_data(left_section)).hexdigest()
-        right_digest = hashlib.sha256(right.section_data(right_section)).hexdigest()
-        if left_digest != right_digest:
-            differences.append(
-                Difference(
-                    "section_content",
-                    f"{label}.sha256",
-                    left_digest,
-                    right_digest,
-                )
-            )
-
-    return differences
-
-
-def _first_mismatch(left: bytes, right: bytes) -> Optional[int]:
-    for index, (left_byte, right_byte) in enumerate(zip(left, right)):
-        if left_byte != right_byte:
-            return index
-    if len(left) != len(right):
-        return min(len(left), len(right))
-    return None
-
-
-def compare(
-    left_path: str,
-    right_path: str,
-    mode: str,
-    ignored_patterns: Sequence[str],
-) -> Dict[str, Any]:
-    left = ElfFile(left_path)
-    right = ElfFile(right_path)
-    byte_equal = left.data == right.data
-    differences = semantic_differences(left, right, ignored_patterns)
-    semantic_equal = not differences
-    selected_equal = byte_equal if mode == "exact" else semantic_equal
-    mismatch = _first_mismatch(left.data, right.data)
-
-    return {
-        "tool": {"name": "elfcompare", "version": VERSION},
-        "mode": mode,
-        "equal": selected_equal,
-        "byte_equal": byte_equal,
-        "semantic_equal": semantic_equal,
-        "left": {
-            "path": os.path.abspath(left_path),
-            "size": len(left.data),
-            "sha256": left.sha256,
-            "class": left.display_class,
-            "endianness": left.display_endian,
-            "type": _format_enum(left.type, ELF_TYPES),
-            "machine": _format_enum(left.machine, MACHINES),
-        },
-        "right": {
-            "path": os.path.abspath(right_path),
-            "size": len(right.data),
-            "sha256": right.sha256,
-            "class": right.display_class,
-            "endianness": right.display_endian,
-            "type": _format_enum(right.type, ELF_TYPES),
-            "machine": _format_enum(right.machine, MACHINES),
-        },
-        "first_byte_mismatch": mismatch,
-        "ignored_section_patterns": list(ignored_patterns),
-        "differences": [difference.as_dict() for difference in differences],
-    }
-
-
-def _short_hash(value: str) -> str:
-    return value[:12]
-
-
-def render_text(report: Dict[str, Any], max_differences: int) -> str:
-    equal = report["equal"]
-    mode = report["mode"]
-    lines = [f"Result: {'CONSISTENT' if equal else 'DIFFERENT'} (mode: {mode})"]
-    for side in ("left", "right"):
-        item = report[side]
-        lines.append(
-            f"{side.capitalize():5}: {item['path']} "
-            f"[{item['class']} {item['endianness']}, {item['machine']}, "
-            f"{item['size']} bytes, sha256={_short_hash(item['sha256'])}...]"
-        )
-
-    lines.append(f"Bytes: {'identical' if report['byte_equal'] else 'different'}")
-    lines.append(
-        "Normalized ELF: "
-        + ("equivalent" if report["semantic_equal"] else "different")
-    )
-    if report["first_byte_mismatch"] is not None:
-        lines.append(f"First byte mismatch: 0x{report['first_byte_mismatch']:x}")
-
-    differences = report["differences"]
-    if differences:
-        lines.append(f"Semantic differences ({len(differences)}):")
-        for difference in differences[:max_differences]:
-            lines.append(
-                f"  - [{difference['category']}] {difference['path']}: "
-                f"{difference['left']} -> {difference['right']}"
-            )
-        omitted = len(differences) - max_differences
-        if omitted > 0:
-            lines.append(f"  ... {omitted} more difference(s)")
-    elif not report["byte_equal"]:
-        lines.append(
-            "Diagnosis: the normalized view found no difference. The changed "
-            "bytes are in ignored sections, layout/padding, or data this view does not model."
-        )
-    return "\n".join(lines)
-
-
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="elfcompare",
@@ -715,21 +405,8 @@ class ComparisonPolicy:
     """Versioned policy applied identically to every CLI invocation."""
 
     timeout: int = 300
-    tool_prefix: str = ""
     readelf: Optional[str] = None
-    eu_elfcmp: Optional[str] = None
     abidiff: Optional[str] = None
-    elf_diff: Optional[str] = None
-    diffoscope: Optional[str] = None
-    abi: str = "auto"
-    require_tool: Tuple[str, ...] = ()
-    level: str = "standard"
-    report_dir: Optional[str] = None
-    skip_function_bodies: bool = False
-    left_path_map: Tuple[Tuple[str, str], ...] = ()
-    right_path_map: Tuple[Tuple[str, str], ...] = ()
-    allow_extra_needed: Tuple[str, ...] = ()
-    allow_needed_reorder: bool = False
 
 
 def _compare_one_build(

@@ -103,4 +103,3 @@ When differences are found:
 | `function-removed` | An ordinary function identifiable by `readelf -sW` exists only in Make |
 | `startup-callback` | Callback count, identity, or order differs in `.preinit_array`, `.init_array`, or `.fini_array` |
 | `abi` | `abidiff` reports a function-signature or structure/class layout change; pure export additions/removals are not duplicated here |
-

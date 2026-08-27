@@ -2,22 +2,17 @@
 
 from __future__ import annotations
 
-import hashlib
-import importlib.util
 import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
-import sys
-from bisect import bisect_left, bisect_right
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import (
     AbstractSet,
     Any,
-    Callable,
     Dict,
     List,
     Optional,
@@ -37,12 +32,10 @@ PT_TLS = 7
 PT_GNU_STACK = 0x6474E551
 PT_GNU_RELRO = 0x6474E552
 ET_REL = 1
-SHT_NOBITS = 8
 SHT_DYNSYM = 11
 SHT_INIT_ARRAY = 14
 SHT_FINI_ARRAY = 15
 SHT_PREINIT_ARRAY = 16
-SHF_ALLOC = 0x2
 SHF_EXECINSTR = 0x4
 EM_386 = 3
 EM_X86_64 = 62
@@ -60,40 +53,6 @@ INITIALIZATION_RELOCATION_WIDTHS = {
     EM_AARCH64: {257: 8, 1025: 8, 1027: 8, 1032: 8},
 }
 
-DATA_RELOCATION_WIDTHS = {
-    EM_386: {1: 4, 2: 4, 6: 4, 7: 4, 8: 4},
-    EM_X86_64: {1: 8, 2: 4, 4: 4, 8: 8, 10: 4, 11: 4},
-    EM_AARCH64: {257: 8, 258: 4, 260: 8, 261: 4, 1027: 8},
-}
-
-DATA_SECTION_PATTERNS = (
-    ".rodata",
-    ".rodata.*",
-    ".data",
-    ".data.*",
-    ".sdata",
-    ".sdata.*",
-    ".bss",
-    ".bss.*",
-    ".sbss",
-    ".sbss.*",
-    ".tdata",
-    ".tdata.*",
-    ".tbss",
-    ".tbss.*",
-)
-
-OMITTED_REPORT_CATEGORIES = frozenset(
-    {
-        "data-symbol",
-        "function",
-        "function-target",
-        "function-boundary",
-        "unattributed-data",
-        "unattributed-relocation",
-    }
-)
-
 # Internal findings keep precise implementation-oriented categories.  Reports
 # expose a smaller vocabulary that describes what changed without leaking the
 # parser or ELF table that produced the evidence.
@@ -107,7 +66,6 @@ PUBLIC_CATEGORY_NAMES = {
     "dynamic": "dependency",
     "version-floor": "runtime-version",
     "initialization-array": "startup-callback",
-    "data": "runtime-data",
     "security-weakened": "security",
 }
 
@@ -139,7 +97,6 @@ PUBLIC_CATEGORY_SECTIONS = {
     "runtime-version": "<version-requirements>",
     "function-added": "<executable-sections>",
     "function-removed": "<executable-sections>",
-    "runtime-data": "<runtime-data-sections>",
     "abi": "<abi-type-information>",
 }
 
@@ -210,38 +167,6 @@ class Finding:
         return result
 
 
-@dataclass(frozen=True)
-class FindingGroup:
-    severity: str
-    category: str
-    count: int
-    examples: Tuple[str, ...]
-
-    def as_dict(self) -> Dict[str, Any]:
-        return {
-            "severity": self.severity,
-            "category": self.category,
-            "count": self.count,
-            "examples": list(self.examples),
-        }
-
-    @classmethod
-    def from_dict(cls, item: Dict[str, Any]) -> "FindingGroup":
-        return cls(
-            severity=str(item["severity"]),
-            category=str(item["category"]),
-            count=int(item["count"]),
-            examples=tuple(str(path) for path in item.get("examples", [])),
-        )
-
-    def displayed_examples(self) -> str:
-        examples = [
-            path if len(path) <= 72 else path[:69] + "..."
-            for path in self.examples[:2]
-        ]
-        return ", ".join(examples)
-
-
 @dataclass(frozen=True, order=True)
 class DynamicSymbol:
     name: str
@@ -294,127 +219,11 @@ class DynamicSymbolChange:
         )
 
 
-@dataclass(frozen=True)
-class UnattributedDataSummary:
-    normalized_size: int
-    printable_strings: Tuple[bytes, ...]
-    printable_strings_sha256: str
-    opaque_size: int
-    opaque_sha256: str
-
-    def as_dict(self, strings_equal: bool) -> Dict[str, Any]:
-        return {
-            "normalized_size": self.normalized_size,
-            "printable_string_count": len(self.printable_strings),
-            "printable_strings_sha256": self.printable_strings_sha256,
-            "opaque_size": self.opaque_size,
-            "opaque_sha256": self.opaque_sha256,
-            "printable_strings_equal": strings_equal,
-        }
-
-
-@dataclass(frozen=True)
-class _SymbolRange:
-    start: int
-    end: int
-    size: int
-    name: str
-
-
-@dataclass
-class _SymbolTargetIndex:
-    """Resolve relocation targets without rescanning every ELF symbol."""
-
-    exact_names: Dict[Tuple[Optional[int], int], str]
-    ranges: Dict[Optional[int], Tuple[_SymbolRange, ...]]
-    starts: Dict[Optional[int], Tuple[int, ...]]
-    prefix_max_ends: Dict[Optional[int], Tuple[int, ...]]
-
-    @classmethod
-    def build(cls, elf: Any, symbols: Sequence[Any]) -> "_SymbolTargetIndex":
-        exact_groups: Dict[Tuple[Optional[int], int], List[Any]] = {}
-        range_groups: Dict[
-            Optional[int], Dict[Tuple[int, int], List[Any]]
-        ] = {}
-        for symbol in symbols:
-            if (
-                not symbol.name
-                or symbol.shndx <= 0
-                or symbol.shndx >= len(elf.sections)
-            ):
-                continue
-            scope = symbol.shndx if elf.type == ET_REL else None
-            exact_groups.setdefault((scope, symbol.value), []).append(symbol)
-            if symbol.size:
-                range_groups.setdefault(scope, {}).setdefault(
-                    (symbol.value, symbol.size), []
-                ).append(symbol)
-
-        exact_names = {}
-        for key, aliases in exact_groups.items():
-            preferred, _ = _preferred_function_aliases(aliases)
-            exact_names[key] = min(symbol.name for symbol in preferred)
-
-        frozen_ranges: Dict[Optional[int], Tuple[_SymbolRange, ...]] = {}
-        starts: Dict[Optional[int], Tuple[int, ...]] = {}
-        prefix_max_ends: Dict[Optional[int], Tuple[int, ...]] = {}
-        for scope, groups in range_groups.items():
-            items = []
-            for (start, size), aliases in groups.items():
-                preferred, _ = _preferred_function_aliases(aliases)
-                items.append(
-                    _SymbolRange(
-                        start,
-                        start + size,
-                        size,
-                        min(symbol.name for symbol in preferred),
-                    )
-                )
-            ordered = tuple(
-                sorted(items, key=lambda item: (item.start, item.size, item.name))
-            )
-            maxima: List[int] = []
-            maximum = 0
-            for item in ordered:
-                maximum = max(maximum, item.end)
-                maxima.append(maximum)
-            frozen_ranges[scope] = ordered
-            starts[scope] = tuple(item.start for item in ordered)
-            prefix_max_ends[scope] = tuple(maxima)
-        return cls(exact_names, frozen_ranges, starts, prefix_max_ends)
-
-    def target(self, scope: Optional[int], address: int) -> Optional[str]:
-        exact = self.exact_names.get((scope, address))
-        if exact is not None:
-            return exact
-        ranges = self.ranges.get(scope, ())
-        starts = self.starts.get(scope, ())
-        prefix_max_ends = self.prefix_max_ends.get(scope, ())
-        index = bisect_right(starts, address) - 1
-        candidates: List[_SymbolRange] = []
-        while index >= 0 and prefix_max_ends[index] > address:
-            candidate = ranges[index]
-            if candidate.start <= address < candidate.end:
-                candidates.append(candidate)
-            index -= 1
-        if not candidates:
-            return None
-        target = min(candidates, key=lambda item: (item.size, item.name))
-        offset = address - target.start
-        suffix = f"+0x{offset:x}" if offset else ""
-        return target.name + suffix
-
-
 class SymbolBinding(str, Enum):
     LOCAL = "LOCAL"
     GLOBAL = "GLOBAL"
     WEAK = "WEAK"
     UNIQUE = "UNIQUE"
-
-
-_PUBLIC_FUNCTION_BINDINGS = frozenset(
-    {SymbolBinding.GLOBAL, SymbolBinding.WEAK, SymbolBinding.UNIQUE}
-)
 
 
 @dataclass(frozen=True)
@@ -430,16 +239,9 @@ class FunctionIdentity:
     fallback: str
     occurrence: int = 1
 
-    def label(self) -> str:
-        base = self.fallback or ", ".join(self.aliases)
-        return base if self.occurrence == 1 else f"{base}#{self.occurrence}"
-
-
 @dataclass(frozen=True)
 class FunctionSymbolMetadata:
-    size: int
     binding: SymbolBinding
-    boundary_reliable: bool
     names: Tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
@@ -449,12 +251,7 @@ class FunctionSymbolMetadata:
 @dataclass
 class FunctionBlock:
     name: str
-    start: int
-    instructions: List[str]
     binding: Optional[SymbolBinding]
-    boundary_reliable: bool
-    degraded_name: bool
-    size: int = 0
     aliases: Tuple[str, ...] = ()
     section: Optional[str] = None
 
@@ -481,20 +278,6 @@ class CommandResult:
     stdout: str
     stderr: str
     timed_out: bool = False
-
-    def as_dict(self, output_file: Optional[str] = None) -> Dict[str, Any]:
-        result: Dict[str, Any] = {
-            "name": self.name,
-            "command": self.command,
-            "returncode": self.returncode,
-            "timed_out": self.timed_out,
-        }
-        if output_file:
-            result["output_file"] = output_file
-        if self.stderr.strip():
-            result["stderr_excerpt"] = self.stderr.strip()[:1000]
-        return result
-
 
 class ToolRunner:
     def __init__(self, timeout: int = 300):
@@ -540,16 +323,9 @@ def resolve_command(explicit: Optional[str], fallback: str) -> Optional[List[str
 
 
 def discover_tools(args: Any) -> Dict[str, Optional[List[str]]]:
-    prefix = args.tool_prefix or ""
-    elf_diff = resolve_command(args.elf_diff, "elf_diff")
-    if elf_diff is None and not args.elf_diff and importlib.util.find_spec("elf_diff"):
-        elf_diff = [sys.executable, "-m", "elf_diff"]
     return {
-        "readelf": resolve_command(args.readelf, prefix + "readelf"),
-        "eu-elfcmp": resolve_command(args.eu_elfcmp, "eu-elfcmp"),
+        "readelf": resolve_command(args.readelf, "readelf"),
         "abidiff": resolve_command(args.abidiff, "abidiff"),
-        "elf_diff": elf_diff,
-        "diffoscope": resolve_command(args.diffoscope, "diffoscope"),
     }
 
 
@@ -1151,14 +927,6 @@ def compare_contracts(
     )
 
 
-_FUNCTION_HEADER = re.compile(r"^\s*([0-9a-fA-F]+)\s+<(.+)>:\s*$")
-_SECTION_HEADER = re.compile(r"^Disassembly of section (.+):\s*$")
-_ADDRESS_PREFIX = re.compile(r"^\s*([0-9a-fA-F]+):\s*")
-_RAW_BYTES = re.compile(r"^(?:(?:[0-9a-fA-F]{2})\s+){2,}")
-_SYMBOL_ADDRESS_PREFIX = re.compile(r"(?<![\w])(?:0x)?[0-9a-fA-F]+\s*(?=<)")
-_RIP_RELATIVE = re.compile(r"-?0x[0-9a-fA-F]+\(%rip\)")
-_ADDRESS_COMMENT = re.compile(r"\s*#\s*(?:0x)?[0-9a-fA-F]+\s*<(.+)>\s*$")
-_TRAILING_SYMBOL_OFFSET = re.compile(r"[+-]0x[0-9a-fA-F]+$")
 _GCC_DERIVED_FUNCTION_SUFFIX = re.compile(
     r"(?:"
     r"\.(?:part|isra|constprop|clone)\.\d+|\.cold(?:\.\d+)?|"
@@ -1182,34 +950,12 @@ def _is_gcc_derived_only_function(block: FunctionBlock) -> bool:
 
 
 def _ignore_one_sided_gcc_derived_function(block: FunctionBlock) -> bool:
-    return (
-        block.binding not in _PUBLIC_FUNCTION_BINDINGS
-        and _is_gcc_derived_only_function(block)
-    )
+    return _is_gcc_derived_only_function(block)
 
 
 def _is_plt_section(name: str) -> bool:
     return name in (".plt", ".iplt") or name.startswith(
         (".plt.", ".iplt.")
-    )
-
-
-def normalize_instruction(line: str) -> str:
-    line = _ADDRESS_PREFIX.sub("", line)
-    line = _RAW_BYTES.sub("", line)
-    address_comment = _ADDRESS_COMMENT.search(line)
-    if address_comment and _RIP_RELATIVE.search(line):
-        line = _RIP_RELATIVE.sub(f"RIPREL<{address_comment.group(1)}>", line)
-        line = _ADDRESS_COMMENT.sub("", line)
-    line = _SYMBOL_ADDRESS_PREFIX.sub("", line)
-    line = re.sub(r"\s+#\s*(?:0x)?[0-9a-fA-F]+\s*$", "", line)
-    return _normalize_space(line)
-
-
-def _is_safe_nop(instruction: str) -> bool:
-    return bool(
-        re.fullmatch(r"(?:(?:data16|cs)\s+)*nop[wlq]?(?:\s+.*)?", instruction)
-        or re.fullmatch(r"xchg[wql]?\s+%ax\s*,\s*%ax", instruction)
     )
 
 
@@ -1230,7 +976,6 @@ def function_symbol_metadata(
     elf: Any,
 ) -> Dict[FunctionLocation, FunctionSymbolMetadata]:
     grouped: Dict[Tuple[int, int], List[Any]] = {}
-    functions_by_section: Dict[int, List[int]] = {}
     for symbol in elf.symbols():
         if (
             symbol.type in (STT_FUNC, STT_GNU_IFUNC)
@@ -1238,36 +983,11 @@ def function_symbol_metadata(
             and 0 < symbol.shndx < len(elf.sections)
         ):
             grouped.setdefault((symbol.shndx, symbol.value), []).append(symbol)
-            functions_by_section.setdefault(symbol.shndx, []).append(symbol.value)
-
-    next_function: Dict[Tuple[int, int], Optional[int]] = {}
-    for section_index, addresses in functions_by_section.items():
-        unique_addresses = sorted(set(addresses))
-        for index, address in enumerate(unique_addresses):
-            next_function[(section_index, address)] = (
-                unique_addresses[index + 1]
-                if index + 1 < len(unique_addresses)
-                else None
-            )
 
     result: Dict[FunctionLocation, FunctionSymbolMetadata] = {}
     ambiguous_keys = set()
     for (section_index, address), symbols in grouped.items():
         identity_symbols, binding = _preferred_function_aliases(symbols)
-        sizes = {symbol.size for symbol in identity_symbols}
-        size = next(iter(sizes)) if len(sizes) == 1 else 0
-        reliable = size > 0
-        if reliable:
-            section = elf.sections[section_index]
-            relative_start = (
-                address if elf.type == ET_REL else address - section.addr
-            )
-            following = next_function[(section_index, address)]
-            reliable = (
-                relative_start >= 0
-                and relative_start + size <= section.size
-                and (following is None or address + size <= following)
-            )
         names = tuple(sorted({symbol.name for symbol in identity_symbols}))
         if elf.type == ET_REL:
             section_name = getattr(elf.sections[section_index], "name", "")
@@ -1282,9 +1002,7 @@ def function_symbol_metadata(
             del result[result_key]
             ambiguous_keys.add(result_key)
             continue
-        result[result_key] = FunctionSymbolMetadata(
-            size, binding, reliable, names
-        )
+        result[result_key] = FunctionSymbolMetadata(binding, names)
     return result
 
 
@@ -1350,7 +1068,6 @@ def parse_readelf_function_symbols(
         if metadata is not None:
             binding = metadata.binding
             aliases = metadata.names
-            size = metadata.size
         else:
             binding = next(
                 candidate
@@ -1359,8 +1076,6 @@ def parse_readelf_function_symbols(
             )
             preferred = [item for item in symbols if item[2] == binding]
             aliases = tuple(sorted({item[0] for item in preferred}))
-            sizes = {item[1] for item in preferred}
-            size = next(iter(sizes)) if len(sizes) == 1 else 0
 
         original_name = aliases[0]
         scope = (
@@ -1374,236 +1089,27 @@ def parse_readelf_function_symbols(
         identity = FunctionIdentity(scope, aliases, "", occurrence)
         functions[identity] = FunctionBlock(
             name=original_name,
-            start=address,
-            instructions=[],
             binding=binding,
-            boundary_reliable=True,
-            degraded_name=False,
-            size=size,
             aliases=aliases,
             section=section.name,
         )
     return functions
 
 
-def _function_comparison_name(name: str) -> Tuple[str, bool]:
-    offset = _TRAILING_SYMBOL_OFFSET.search(name)
-    if not offset:
-        return name, False
-    return name[: offset.start()] + "<UNRESOLVED_FUNCTION_OFFSET>", True
-
-
-def parse_objdump_function_blocks(
-    output: str,
-    metadata: Dict[FunctionLocation, FunctionSymbolMetadata],
-    assume_boundaries_reliable: bool = False,
-) -> Dict[FunctionIdentity, FunctionBlock]:
-    functions: Dict[FunctionIdentity, FunctionBlock] = {}
-    occurrences: Dict[FunctionIdentity, int] = {}
-    current: Optional[FunctionBlock] = None
-    current_section: Optional[str] = None
-    for line in output.splitlines():
-        section_header = _SECTION_HEADER.match(line)
-        if section_header:
-            current_section = section_header.group(1)
-            current = None
-            continue
-        header = _FUNCTION_HEADER.match(line)
-        if header:
-            if current_section and _is_plt_section(current_section):
-                current = None
-                continue
-            start = int(header.group(1), 16)
-            original_name = header.group(2)
-            scoped_location = (
-                FunctionLocation(current_section, start)
-                if current_section
-                else None
-            )
-            symbol = metadata.get(scoped_location) if scoped_location else None
-            section_scoped = symbol is not None
-            if symbol is None:
-                symbol = metadata.get(FunctionLocation(None, start))
-            normalized_name, degraded_name = _function_comparison_name(
-                original_name
-            )
-            is_section_local = (
-                section_scoped
-                and symbol is not None
-                and symbol.binding == SymbolBinding.LOCAL
-            )
-            scope = (current_section or "") if is_section_local else ""
-            base_identity = FunctionIdentity(
-                scope=scope,
-                aliases=symbol.names if symbol and symbol.names else (),
-                fallback="" if symbol and symbol.names else normalized_name,
-                occurrence=1,
-            )
-            occurrence = occurrences.get(base_identity, 0) + 1
-            occurrences[base_identity] = occurrence
-            identity = FunctionIdentity(
-                scope=base_identity.scope,
-                aliases=base_identity.aliases,
-                fallback=base_identity.fallback,
-                occurrence=occurrence,
-            )
-            current = FunctionBlock(
-                name=original_name,
-                start=start,
-                instructions=[],
-                binding=symbol.binding if symbol else None,
-                boundary_reliable=(
-                    symbol.boundary_reliable
-                    if symbol
-                    else assume_boundaries_reliable
-                ),
-                degraded_name=degraded_name,
-                size=symbol.size if symbol else 0,
-                aliases=symbol.names if symbol else (),
-                section=current_section,
-            )
-            functions[identity] = current
-            continue
-        instruction_match = _ADDRESS_PREFIX.match(line)
-        if current is None or not instruction_match:
-            continue
-        address = int(instruction_match.group(1), 16)
-        if (
-            current.boundary_reliable
-            and current.size > 0
-            and address >= current.start + current.size
-        ):
-            continue
-        instruction = normalize_instruction(line)
-        if instruction and not _is_safe_nop(instruction):
-            current.instructions.append(instruction)
-    return functions
-
-
-def parse_objdump_functions(output: str) -> Dict[str, List[str]]:
-    """Compatibility view used by callers that do not provide ELF symbols."""
-    return {
-        identity.label(): block.instructions
-        for identity, block in parse_objdump_function_blocks(
-            output, {}, assume_boundaries_reliable=True
-        ).items()
-    }
-
-
-def _function_blocks(
-    functions: Dict[Any, Any]
-) -> Dict[FunctionIdentity, FunctionBlock]:
-    blocks: Dict[FunctionIdentity, FunctionBlock] = {}
-    for name, value in functions.items():
-        identity = (
-            name
-            if isinstance(name, FunctionIdentity)
-            else FunctionIdentity("", (), str(name))
-        )
-        binding = value.binding if isinstance(value, FunctionBlock) else None
-        is_public = binding in _PUBLIC_FUNCTION_BINDINGS
-        if identity.aliases and binding == SymbolBinding.LOCAL:
-            aliases = tuple(
-                sorted(
-                    {
-                        _gcc_function_family_name(alias)
-                        for alias in identity.aliases
-                    }
-                )
-            )
-            if aliases != identity.aliases:
-                identity = FunctionIdentity("", aliases, identity.fallback)
-        elif not identity.aliases and not is_public:
-            family = _gcc_function_family_name(identity.fallback)
-            if family != identity.fallback:
-                identity = FunctionIdentity(identity.scope, (), family)
-        if isinstance(value, FunctionBlock):
-            block = value
-        else:
-            block = FunctionBlock(
-                name=str(name),
-                start=0,
-                instructions=list(value),
-                binding=None,
-                boundary_reliable=True,
-                degraded_name=False,
-                aliases=(),
-            )
-        existing = blocks.get(identity)
-        if existing is None or (
-            _is_gcc_derived_only_function(existing)
-            and not _is_gcc_derived_only_function(block)
-        ):
-            blocks[identity] = block
-    return blocks
-
-
-def _function_path(
-    key: FunctionIdentity,
-    left: Optional[FunctionBlock],
-    right: Optional[FunctionBlock],
-) -> str:
-    if left and right and left.name != right.name:
-        return f"{left.name} <-> {right.name}"
-    block = left or right
-    return block.name if block else key.label()
-
-
 def _compare_one_sided_function(
-    key: FunctionIdentity, block: FunctionBlock, side: str
-) -> Finding:
-    path = _function_path(
-        key,
-        block if side == "left" else None,
-        block if side == "right" else None,
-    )
+    block: FunctionBlock, side: str
+) -> Optional[Finding]:
     if side == "right" and block.binding == SymbolBinding.WEAK:
-        return Finding(
-            "INFO",
-            "function-added-weak",
-            path,
-            "<missing>",
-            "<present>",
-            "Bazel adds a WEAK function body already classified as an informational export addition.",
-            section=block.section,
-        )
-
-    direction_is_conclusive = (
-        side == "left"
-        and block.binding in (
-            SymbolBinding.GLOBAL,
-            SymbolBinding.UNIQUE,
-            SymbolBinding.WEAK,
-        )
-    ) or (
-        side == "right"
-        and block.binding in (SymbolBinding.GLOBAL, SymbolBinding.UNIQUE)
-    )
-    if direction_is_conclusive or (
-        not block.degraded_name and block.boundary_reliable
-    ):
-        return Finding(
-            "FAIL",
-            "function-removed" if side == "left" else "function-added",
-            path,
-            "<present>" if side == "left" else "<missing>",
-            "<missing>" if side == "left" else "<present>",
-            "A Make function is absent from Bazel."
-            if side == "left"
-            else "Bazel adds a non-WEAK function.",
-            section=block.section,
-        )
-
+        return None
     return Finding(
-        "ERROR",
-        "function-boundary",
-        path,
+        "FAIL",
+        "function-removed" if side == "left" else "function-added",
+        block.name,
         "<present>" if side == "left" else "<missing>",
         "<missing>" if side == "left" else "<present>",
-        (
-            f"The {'Make' if side == 'left' else 'Bazel'}-only objdump block "
-            "has an unstable stripped name or lacks a reliable st_size boundary."
-        ),
+        "A Make function is absent from Bazel."
+        if side == "left"
+        else "Bazel adds a non-WEAK function.",
         section=block.section,
     )
 
@@ -1612,15 +1118,14 @@ def _pair_function_blocks(
     left: Dict[FunctionIdentity, FunctionBlock],
     right: Dict[FunctionIdentity, FunctionBlock],
 ) -> Tuple[
-    List[Tuple[FunctionIdentity, FunctionBlock, FunctionBlock]],
     Dict[FunctionIdentity, FunctionBlock],
     Dict[FunctionIdentity, FunctionBlock],
 ]:
     left_remaining = dict(left)
     right_remaining = dict(right)
-    pairs: List[Tuple[FunctionIdentity, FunctionBlock, FunctionBlock]] = []
     for key in sorted(set(left_remaining) & set(right_remaining)):
-        pairs.append((key, left_remaining.pop(key), right_remaining.pop(key)))
+        left_remaining.pop(key)
+        right_remaining.pop(key)
 
     while True:
         candidates: Dict[FunctionIdentity, List[FunctionIdentity]] = {}
@@ -1645,27 +1150,31 @@ def _pair_function_blocks(
         if not unique_pairs:
             break
         for left_key, right_key in sorted(unique_pairs):
-            left_block = left_remaining.pop(left_key)
-            right_block = right_remaining.pop(right_key)
-            pairs.append((left_key, left_block, right_block))
-    return pairs, left_remaining, right_remaining
+            left_remaining.pop(left_key)
+            right_remaining.pop(right_key)
+    return left_remaining, right_remaining
 
 
-def compare_functions(left: Dict[str, Any], right: Dict[str, Any]) -> List[Finding]:
-    left_blocks = _function_blocks(left)
-    right_blocks = _function_blocks(right)
+def compare_functions(
+    left: Dict[FunctionIdentity, FunctionBlock],
+    right: Dict[FunctionIdentity, FunctionBlock],
+) -> List[Finding]:
     findings: List[Finding] = []
-    _, left_remaining, right_remaining = _pair_function_blocks(
-        left_blocks, right_blocks
+    left_remaining, right_remaining = _pair_function_blocks(
+        left, right
     )
     for key, left_block in sorted(left_remaining.items()):
         if _ignore_one_sided_gcc_derived_function(left_block):
             continue
-        findings.append(_compare_one_sided_function(key, left_block, "left"))
+        finding = _compare_one_sided_function(left_block, "left")
+        if finding is not None:
+            findings.append(finding)
     for key, right_block in sorted(right_remaining.items()):
         if _ignore_one_sided_gcc_derived_function(right_block):
             continue
-        findings.append(_compare_one_sided_function(key, right_block, "right"))
+        finding = _compare_one_sided_function(right_block, "right")
+        if finding is not None:
+            findings.append(finding)
     return findings
 
 
@@ -2108,981 +1617,6 @@ def _matches_any(name: str, patterns: Sequence[str]) -> bool:
     return any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)
 
 
-def _normalize_paths(raw: bytes, maps: Sequence[Tuple[str, str]]) -> bytes:
-    normalized = raw
-    for source, destination in sorted(
-        maps, key=lambda item: len(item[0]), reverse=True
-    ):
-        normalized = normalized.replace(
-            source.encode("utf-8", errors="surrogateescape"),
-            destination.encode("utf-8", errors="surrogateescape"),
-        )
-    return normalized
-
-
-def _mask_data_slots(
-    raw: bytes, slot_widths: Dict[int, int]
-) -> bytes:
-    if not slot_widths:
-        return raw
-    masked = bytearray(raw)
-    for start, width in slot_widths.items():
-        if not 0 <= start < len(masked):
-            continue
-        end = min(start + width, len(masked))
-        masked[start:end] = b"\0" * (end - start)
-    return bytes(masked)
-
-
-def _normalized_data_digest(
-    raw: bytes,
-    pointer_size: int,
-    byteorder: str,
-    address_names: Dict[int, str],
-    masked_slot_widths: Optional[Dict[int, int]] = None,
-) -> str:
-    normalized = _mask_data_slots(raw, masked_slot_widths or {})
-    digest = hashlib.sha256()
-    cursor = 0
-    while cursor + pointer_size <= len(normalized):
-        chunk = normalized[cursor : cursor + pointer_size]
-        value = int.from_bytes(chunk, byteorder=byteorder, signed=False)
-        target = address_names.get(value)
-        if target:
-            digest.update(
-                b"PTR\0"
-                + target.encode("utf-8", errors="backslashreplace")
-                + b"\0"
-            )
-        else:
-            digest.update(b"RAW\0" + chunk)
-        cursor += pointer_size
-    digest.update(normalized[cursor:])
-    return digest.hexdigest()
-
-
-def _unattributed_data_summary(raw: bytes) -> UnattributedDataSummary:
-    strings: List[bytes] = []
-    opaque = bytearray(raw)
-    for match in re.finditer(rb"[\x20-\x7e]+\0", raw):
-        strings.append(match.group()[:-1])
-        opaque[match.start() : match.end()] = b"\0" * (match.end() - match.start())
-    strings.sort()
-    opaque_bytes = bytes(opaque).rstrip(b"\0")
-    string_digest = hashlib.sha256(b"\0".join(strings)).hexdigest()
-    return UnattributedDataSummary(
-        normalized_size=len(raw.rstrip(b"\0")),
-        printable_strings=tuple(strings),
-        printable_strings_sha256=string_digest,
-        opaque_size=len(opaque_bytes),
-        opaque_sha256=hashlib.sha256(opaque_bytes).hexdigest(),
-    )
-
-
-def _selected_data_sections(
-    elf: Any, ignored_patterns: Sequence[str]
-) -> Dict[str, Any]:
-    return {
-        section.name: section
-        for section in elf.sections
-        if section.index != 0
-        and section.flags & SHF_ALLOC
-        and _matches_any(section.name, DATA_SECTION_PATTERNS)
-        and not _matches_any(section.name, ignored_patterns)
-    }
-
-
-def _relocation_width(elf: Any, relocation: Any) -> int:
-    return DATA_RELOCATION_WIDTHS.get(elf.machine, {}).get(
-        relocation.type, 0
-    )
-
-
-def _section_data_cached(
-    elf: Any, section: Any, cache: Optional[Dict[int, bytes]]
-) -> bytes:
-    if cache is None:
-        return elf.section_data(section)
-    data = cache.get(section.index)
-    if data is None:
-        data = elf.section_data(section)
-        cache[section.index] = data
-    return data
-
-
-def _relocation_effective_addend(
-    elf: Any,
-    relocation: Any,
-    section_data_cache: Optional[Dict[int, bytes]] = None,
-) -> Optional[int]:
-    if relocation.addend is not None:
-        return relocation.addend
-    width = _relocation_width(elf, relocation)
-    if not width or not 0 <= relocation.target_section_index < len(elf.sections):
-        return None
-    section = elf.sections[relocation.target_section_index]
-    data = _section_data_cached(elf, section, section_data_cache)
-    start = relocation.offset
-    end = start + width
-    if start < 0 or end > len(data):
-        return None
-    byteorder = "little" if elf.display_endian == "little" else "big"
-    signed_types = {
-        EM_386: {2},
-        EM_X86_64: {2, 4, 11},
-        EM_AARCH64: {260, 261},
-    }
-    return int.from_bytes(
-        data[start:end],
-        byteorder=byteorder,
-        signed=relocation.type in signed_types.get(elf.machine, set()),
-    )
-
-
-def _relocation_string_target(
-    elf: Any,
-    relocation: Any,
-    path_maps: Sequence[Tuple[str, str]],
-    addend: Optional[int] = None,
-    section_data_cache: Optional[Dict[int, bytes]] = None,
-) -> Optional[str]:
-    if addend is None:
-        addend = _relocation_effective_addend(
-            elf, relocation, section_data_cache
-        )
-    if addend is None:
-        return None
-    target_section = None
-    target_offset = None
-    if (
-        elf.type == ET_REL
-        and 0 < relocation.symbol_section_index < len(elf.sections)
-    ):
-        target_section = elf.sections[relocation.symbol_section_index]
-        if target_section.flags & SHF_EXECINSTR:
-            return None
-        target_offset = relocation.symbol_value + addend
-    else:
-        address = relocation.symbol_value + addend
-        candidates = [
-            candidate
-            for candidate in elf.sections
-            if candidate.index != 0
-            and candidate.flags & SHF_ALLOC
-            and not candidate.flags & SHF_EXECINSTR
-            and candidate.type != SHT_NOBITS
-            and candidate.addr <= address < candidate.addr + candidate.size
-        ]
-        if candidates:
-            target_section = min(candidates, key=lambda item: item.size)
-            target_offset = address - target_section.addr
-    if target_section is None or target_offset is None:
-        return None
-    data = _section_data_cached(elf, target_section, section_data_cache)
-    if not (0 <= target_offset < len(data)):
-        return None
-    end = data.find(b"\0", target_offset, min(len(data), target_offset + 4096))
-    if end < 0:
-        return None
-    value = _normalize_paths(data[target_offset:end], path_maps)
-    if not value or any(byte < 0x20 or byte > 0x7E for byte in value):
-        return None
-    return "string:" + value.decode("ascii")
-
-
-def _relocation_symbol_target(
-    elf: Any,
-    relocation: Any,
-    symbol_targets: _SymbolTargetIndex,
-    addend: Optional[int] = None,
-    section_data_cache: Optional[Dict[int, bytes]] = None,
-) -> Optional[str]:
-    if addend is None:
-        addend = _relocation_effective_addend(
-            elf, relocation, section_data_cache
-        )
-    if addend is None:
-        return None
-    address = relocation.symbol_value + addend
-    scoped_section = (
-        relocation.symbol_section_index if elf.type == ET_REL else None
-    )
-    target = symbol_targets.target(scoped_section, address)
-    if target is None:
-        return None
-    return f"symbol:{target}"
-
-
-def _relocation_target_identity(
-    elf: Any,
-    relocation: Any,
-    path_maps: Sequence[Tuple[str, str]],
-    symbol_targets: _SymbolTargetIndex,
-    section_data_cache: Optional[Dict[int, bytes]] = None,
-) -> Tuple[Any, bool]:
-    addend = _relocation_effective_addend(
-        elf, relocation, section_data_cache
-    )
-    string_target = _relocation_string_target(
-        elf, relocation, path_maps, addend, section_data_cache
-    )
-    if string_target is not None:
-        return string_target, True
-    if relocation.symbol_name:
-        if addend is None:
-            return f"symbol:{relocation.symbol_name}", False
-        suffix = f"{addend:+#x}" if addend else ""
-        return f"symbol:{relocation.symbol_name}{suffix}", True
-    symbol_target = _relocation_symbol_target(
-        elf, relocation, symbol_targets, addend, section_data_cache
-    )
-    if symbol_target is not None:
-        return symbol_target, True
-    return addend, False
-
-
-def _unowned_relocation_target(
-    elf: Any,
-    relocation: Any,
-    path_maps: Sequence[Tuple[str, str]],
-    section_data_cache: Optional[Dict[int, bytes]] = None,
-) -> Any:
-    """Preserve conservative legacy evidence when no data owner is known."""
-
-    addend = _relocation_effective_addend(
-        elf, relocation, section_data_cache
-    )
-    string_target = _relocation_string_target(
-        elf, relocation, path_maps, addend, section_data_cache
-    )
-    return string_target if string_target is not None else addend
-
-
-def _bounded_relocation_detail(
-    left: Sequence[Tuple[Any, ...]],
-    right: Sequence[Tuple[Any, ...]],
-    describe: Callable[[str, Tuple[Any, ...]], str],
-    limit_per_side: int,
-    footer: Optional[str] = None,
-) -> str:
-    left_only = sorted(set(left) - set(right), key=repr)
-    right_only = sorted(set(right) - set(left), key=repr)
-    lines = [
-        describe("Make", item) for item in left_only[:limit_per_side]
-    ]
-    lines.extend(
-        describe("Bazel", item) for item in right_only[:limit_per_side]
-    )
-    omitted = max(0, len(left_only) - limit_per_side) + max(
-        0, len(right_only) - limit_per_side
-    )
-    if omitted:
-        lines.append(f"... {omitted} more unmatched relocation(s)")
-    if footer:
-        lines.append(footer)
-    return "\n".join(lines)
-
-
-def unattributed_relocation_detail(
-    left: Sequence[Tuple[Any, ...]],
-    right: Sequence[Tuple[Any, ...]],
-    limit_per_side: int = 5,
-) -> str:
-    """Render actionable samples for relocations outside named data symbols."""
-
-    def describe(side: str, item: Tuple[Any, ...]) -> str:
-        section, offset, relocation_type, symbol, target = item
-        target_text = f", target={target}" if target is not None else ""
-        return (
-            f"{side}-only {section}+0x{offset:x}: type={relocation_type}, "
-            f"symbol={symbol or '<none>'}{target_text}"
-        )
-
-    return _bounded_relocation_detail(
-        left,
-        right,
-        describe,
-        limit_per_side,
-        "Relocations differ outside named data symbols; ownership cannot be "
-        "normalized safely.",
-    )
-
-
-def data_symbol_relocation_detail(
-    left: Sequence[Tuple[Any, ...]],
-    right: Sequence[Tuple[Any, ...]],
-    limit_per_side: int = 5,
-) -> str:
-    """Render bounded semantic relocation differences within one data object."""
-
-    def describe(side: str, item: Tuple[Any, ...]) -> str:
-        offset, relocation_type, symbol, target = item
-        target_text = f", target={target}" if target is not None else ""
-        return (
-            f"{side}-only slot+0x{offset:x}: type={relocation_type}, "
-            f"symbol={symbol or '<none>'}{target_text}"
-        )
-
-    return _bounded_relocation_detail(
-        left, right, describe, limit_per_side
-    )
-
-
-def compare_data_sections(
-    left_elf: Any,
-    right_elf: Any,
-    ignored_patterns: Sequence[str],
-    left_path_maps: Sequence[Tuple[str, str]] = (),
-    right_path_maps: Sequence[Tuple[str, str]] = (),
-    dynamic_symbols_only: bool = False,
-) -> List[Finding]:
-    findings: List[Finding] = []
-    left_sections = _selected_data_sections(left_elf, ignored_patterns)
-    right_sections = _selected_data_sections(right_elf, ignored_patterns)
-
-    def symbol_records(
-        elf: Any, sections: Dict[str, Any], path_maps: Sequence[Tuple[str, str]]
-    ) -> Tuple[
-        Dict[Tuple[Any, ...], Dict[str, Any]],
-        Dict[str, List[Tuple[int, int]]],
-        List[Tuple[Any, ...]],
-    ]:
-        all_symbols = elf.dynamic_symbols() if dynamic_symbols_only else elf.symbols()
-        all_relocations = [
-            relocation
-            for relocation in elf.relocations()
-            if elf.sections[relocation.target_section_index].name in sections
-        ]
-        symbol_targets = _SymbolTargetIndex.build(elf, all_symbols)
-        address_groups: Dict[int, List[Any]] = {}
-        for symbol in all_symbols:
-            if symbol.name and 0 < symbol.shndx < len(elf.sections):
-                address_groups.setdefault(symbol.value, []).append(symbol)
-        address_names = {}
-        for address, aliases in address_groups.items():
-            preferred, _ = _preferred_function_aliases(aliases)
-            address_names[address] = min(
-                symbol.name for symbol in preferred
-            )
-        indexed_relocations: Dict[
-            int, List[Tuple[int, int, Any]]
-        ] = {}
-        for index, relocation in enumerate(all_relocations):
-            indexed_relocations.setdefault(
-                relocation.target_section_index, []
-            ).append((relocation.offset, index, relocation))
-        relocation_offsets: Dict[int, Tuple[int, ...]] = {}
-        for section_index, items in indexed_relocations.items():
-            items.sort(key=lambda item: (item[0], item[1]))
-            relocation_offsets[section_index] = tuple(
-                item[0] for item in items
-            )
-        owned_relocation_indices = set()
-        section_data_cache: Dict[int, bytes] = {}
-        occurrences: Dict[Tuple[Any, ...], int] = {}
-        records: Dict[Tuple[Any, ...], Dict[str, Any]] = {}
-        covered: Dict[str, List[Tuple[int, int]]] = {}
-        byteorder = "little" if elf.display_endian == "little" else "big"
-        pointer_size = 4 if elf.display_class == "ELF32" else 8
-
-        for symbol in all_symbols:
-            if (
-                symbol.type not in (1, 6)  # STT_OBJECT, STT_TLS
-                or not symbol.name
-                or symbol.size == 0
-                or symbol.shndx <= 0
-                or symbol.shndx >= len(elf.sections)
-            ):
-                continue
-            section = elf.sections[symbol.shndx]
-            if section.name not in sections:
-                continue
-            relative = symbol.value if elf.type == 1 else symbol.value - section.addr
-            if relative < 0 or relative + symbol.size > section.size:
-                findings.append(
-                    Finding(
-                        "ERROR",
-                        "data",
-                        f"symbol:{symbol.name}",
-                        "valid section range",
-                        f"offset={relative}, size={symbol.size}",
-                    )
-                )
-                continue
-            covered.setdefault(section.name, []).append((relative, relative + symbol.size))
-            section_relocations = indexed_relocations.get(symbol.shndx, [])
-            offsets = relocation_offsets.get(symbol.shndx, ())
-            first = bisect_left(offsets, relative)
-            last = bisect_left(offsets, relative + symbol.size)
-            owned_entries = section_relocations[first:last]
-            owned_relocation_indices.update(
-                index for _, index, _ in owned_entries
-            )
-            owned_relocations = [
-                relocation for _, _, relocation in owned_entries
-            ]
-            if section.type == SHT_NOBITS:
-                digest = hashlib.sha256(f"zero:{symbol.size}".encode()).hexdigest()
-                raw = None
-            else:
-                raw_buffer = bytearray(
-                    _section_data_cached(
-                        elf, section, section_data_cache
-                    )[relative : relative + symbol.size]
-                )
-                for relocation in owned_relocations:
-                    width = _relocation_width(elf, relocation)
-                    start = relocation.offset - relative
-                    if not width:
-                        # The unknown slot is excluded from confirmed byte
-                        # differences, but remains an explicit coverage error.
-                        width = pointer_size
-                    if width:
-                        end = min(start + width, len(raw_buffer))
-                        raw_buffer[start:end] = b"\0" * (end - start)
-                raw = _normalize_paths(bytes(raw_buffer), path_maps)
-                digest = _normalized_data_digest(
-                    raw, pointer_size, byteorder, address_names
-                )
-            relocation_records = []
-            resolved_relocations = []
-            unresolved_relocations = []
-            unsupported_relocations = []
-            uncertain_slot_widths: Dict[int, int] = {}
-            for relocation in owned_relocations:
-                target, resolved = _relocation_target_identity(
-                    elf,
-                    relocation,
-                    path_maps,
-                    symbol_targets,
-                    section_data_cache,
-                )
-                record = (
-                    relocation.offset - relative,
-                    relocation.type,
-                    relocation.symbol_name,
-                    target,
-                )
-                relocation_records.append(record)
-                relocation_width = _relocation_width(elf, relocation)
-                slot = relocation.offset - relative
-                if not relocation_width:
-                    unsupported_relocations.append(record)
-                    uncertain_slot_widths[slot] = max(
-                        uncertain_slot_widths.get(slot, 0), pointer_size
-                    )
-                elif resolved:
-                    resolved_relocations.append(record)
-                else:
-                    unresolved_relocations.append(record)
-                    uncertain_slot_widths[slot] = max(
-                        uncertain_slot_widths.get(slot, 0), relocation_width
-                    )
-            symbol_relocations = tuple(
-                sorted(relocation_records, key=repr)
-            )
-            unresolved_relocations_tuple = tuple(
-                sorted(unresolved_relocations, key=repr)
-            )
-            resolved_relocations_tuple = tuple(
-                sorted(resolved_relocations, key=repr)
-            )
-            unsupported_relocations_tuple = tuple(
-                sorted(unsupported_relocations, key=repr)
-            )
-            content_digest = digest
-            if symbol_relocations:
-                relocation_digest = hashlib.sha256()
-                relocation_digest.update(digest.encode())
-                relocation_digest.update(repr(symbol_relocations).encode())
-                digest = relocation_digest.hexdigest()
-            base_key = (symbol.name, symbol.type, symbol.binding)
-            occurrence = occurrences.get(base_key, 0)
-            occurrences[base_key] = occurrence + 1
-            key = base_key + (occurrence,)
-            records[key] = {
-                "section": section.name,
-                "section_flags": section.flags,
-                "size": len(raw) if raw is not None else symbol.size,
-                "sha256": digest,
-                "content_sha256": content_digest,
-                "relocations": symbol_relocations,
-                "resolved_relocations": resolved_relocations_tuple,
-                "unresolved_relocations": unresolved_relocations_tuple,
-                "unsupported_relocations": unsupported_relocations_tuple,
-                "raw": raw,
-                "_pointer_size": pointer_size,
-                "_byteorder": byteorder,
-                "_address_names": address_names,
-                "_uncertain_slot_widths": uncertain_slot_widths,
-            }
-        unowned_relocations = []
-        for index, relocation in enumerate(all_relocations):
-            section_name = elf.sections[relocation.target_section_index].name
-            if index not in owned_relocation_indices:
-                unowned_relocations.append(
-                    (
-                        section_name,
-                        relocation.offset,
-                        relocation.type,
-                        relocation.symbol_name,
-                        _unowned_relocation_target(
-                            elf,
-                            relocation,
-                            path_maps,
-                            section_data_cache,
-                        ),
-                    )
-                )
-        return records, covered, sorted(unowned_relocations, key=repr)
-
-    left_records, left_covered, left_unowned_relocations = symbol_records(
-        left_elf, left_sections, left_path_maps
-    )
-    right_records, right_covered, right_unowned_relocations = symbol_records(
-        right_elf, right_sections, right_path_maps
-    )
-    for key in sorted(set(left_records) | set(right_records)):
-        name = key[0] if key[3] == 0 else f"{key[0]}#{key[3] + 1}"
-        left_record = left_records.get(key)
-        right_record = right_records.get(key)
-        if left_record is None or right_record is None:
-            findings.append(
-                Finding(
-                    "FAIL",
-                    "data-symbol",
-                    name,
-                    "<missing>" if left_record is None else "<present>",
-                    "<missing>" if right_record is None else "<present>",
-                )
-            )
-            continue
-        comparable_left = {
-            item: value
-            for item, value in left_record.items()
-            if item != "raw" and not item.startswith("_")
-        }
-        comparable_right = {
-            item: value
-            for item, value in right_record.items()
-            if item != "raw" and not item.startswith("_")
-        }
-        unsupported_present = bool(
-            left_record["unsupported_relocations"]
-            or right_record["unsupported_relocations"]
-        )
-        unresolved_present = bool(
-            left_record["unresolved_relocations"]
-            or right_record["unresolved_relocations"]
-        )
-        uncertain_slot_widths: Dict[int, int] = {}
-        for slot_widths in (
-            left_record["_uncertain_slot_widths"],
-            right_record["_uncertain_slot_widths"],
-        ):
-            for slot, width in slot_widths.items():
-                uncertain_slot_widths[slot] = max(
-                    uncertain_slot_widths.get(slot, 0), width
-                )
-        uncertain_slots = set(uncertain_slot_widths)
-        comparable_left_resolved = tuple(
-            item
-            for item in left_record["resolved_relocations"]
-            if item[0] not in uncertain_slots
-        )
-        comparable_right_resolved = tuple(
-            item
-            for item in right_record["resolved_relocations"]
-            if item[0] not in uncertain_slots
-        )
-        if (
-            comparable_left != comparable_right
-            or unsupported_present
-            or unresolved_present
-        ):
-            content_detail_parts = []
-            left_raw = left_record["raw"]
-            right_raw = right_record["raw"]
-            left_comparison_raw = (
-                _mask_data_slots(
-                    left_raw,
-                    uncertain_slot_widths,
-                )
-                if left_raw is not None
-                else None
-            )
-            right_comparison_raw = (
-                _mask_data_slots(
-                    right_raw,
-                    uncertain_slot_widths,
-                )
-                if right_raw is not None
-                else None
-            )
-            if (
-                left_comparison_raw is not None
-                and right_comparison_raw is not None
-            ):
-                mismatch = next(
-                    (
-                        index
-                        for index, pair in enumerate(
-                            zip(left_comparison_raw, right_comparison_raw)
-                        )
-                        if pair[0] != pair[1]
-                    ),
-                    min(len(left_comparison_raw), len(right_comparison_raw))
-                    if len(left_comparison_raw) != len(right_comparison_raw)
-                    else None,
-                )
-                if mismatch is not None:
-                    left_byte = (
-                        left_comparison_raw[mismatch]
-                        if mismatch < len(left_comparison_raw)
-                        else "<end>"
-                    )
-                    right_byte = (
-                        right_comparison_raw[mismatch]
-                        if mismatch < len(right_comparison_raw)
-                        else "<end>"
-                    )
-                    content_detail_parts.append(
-                        "first differing byte at symbol offset "
-                        f"0x{mismatch:x}: {left_byte!r} -> {right_byte!r}"
-                    )
-            resolved_differs = (
-                comparable_left_resolved != comparable_right_resolved
-            )
-            unresolved_differs = (
-                left_record["unresolved_relocations"]
-                != right_record["unresolved_relocations"]
-            )
-            if resolved_differs:
-                content_detail_parts.append(
-                    data_symbol_relocation_detail(
-                        comparable_left_resolved,
-                        comparable_right_resolved,
-                    )
-                )
-            left_content_digest = (
-                _normalized_data_digest(
-                    left_raw,
-                    left_record["_pointer_size"],
-                    left_record["_byteorder"],
-                    left_record["_address_names"],
-                    uncertain_slot_widths,
-                )
-                if left_raw is not None
-                else left_record["content_sha256"]
-            )
-            right_content_digest = (
-                _normalized_data_digest(
-                    right_raw,
-                    right_record["_pointer_size"],
-                    right_record["_byteorder"],
-                    right_record["_address_names"],
-                    uncertain_slot_widths,
-                )
-                if right_raw is not None
-                else right_record["content_sha256"]
-            )
-            content_keys = ("section", "section_flags", "size")
-            content_differs = any(
-                left_record[key] != right_record[key] for key in content_keys
-            ) or left_content_digest != right_content_digest
-            if content_differs or resolved_differs:
-                finding_left = dict(comparable_left)
-                finding_right = dict(comparable_right)
-                finding_left["content_sha256"] = left_content_digest
-                finding_right["content_sha256"] = right_content_digest
-                findings.append(
-                    Finding(
-                        "FAIL",
-                        "data-symbol",
-                        name,
-                        finding_left,
-                        finding_right,
-                        "\n".join(
-                            part for part in content_detail_parts if part
-                        )
-                        or None,
-                    )
-                )
-            if unresolved_present or unsupported_present:
-                coverage_details = []
-                if unresolved_present:
-                    coverage_details.append(
-                        "Unresolved relocation target(s): "
-                        f"Make={len(left_record['unresolved_relocations'])}, "
-                        f"Bazel={len(right_record['unresolved_relocations'])}."
-                    )
-                if unresolved_differs:
-                    coverage_details.append(
-                        data_symbol_relocation_detail(
-                            left_record["unresolved_relocations"],
-                            right_record["unresolved_relocations"],
-                        )
-                    )
-                if unsupported_present:
-                    left_types = sorted(
-                        {
-                            item[1]
-                            for item in left_record[
-                                "unsupported_relocations"
-                            ]
-                        }
-                    )
-                    right_types = sorted(
-                        {
-                            item[1]
-                            for item in right_record[
-                                "unsupported_relocations"
-                            ]
-                        }
-                    )
-                    coverage_details.append(
-                        "Unsupported relocation type(s): "
-                        f"Make={left_types or '<none>'}, "
-                        f"Bazel={right_types or '<none>'}."
-                    )
-                findings.append(
-                    Finding(
-                        "ERROR",
-                        "data-relocation-coverage",
-                        name,
-                        {
-                            "section": left_record["section"],
-                            "unresolved_relocations": left_record[
-                                "unresolved_relocations"
-                            ],
-                            "unsupported_relocations": left_record[
-                                "unsupported_relocations"
-                            ],
-                        },
-                        {
-                            "section": right_record["section"],
-                            "unresolved_relocations": right_record[
-                                "unresolved_relocations"
-                            ],
-                            "unsupported_relocations": right_record[
-                                "unsupported_relocations"
-                            ],
-                        },
-                        (
-                            "At least one owned-data relocation cannot be "
-                            "normalized safely.\n"
-                            + "\n".join(
-                                detail for detail in coverage_details if detail
-                            )
-                        ),
-                    )
-                )
-
-    if left_unowned_relocations != right_unowned_relocations:
-        findings.append(
-            Finding(
-                "ERROR",
-                "unattributed-relocation",
-                "allocated data relocation",
-                left_unowned_relocations,
-                right_unowned_relocations,
-                unattributed_relocation_detail(
-                    left_unowned_relocations, right_unowned_relocations
-                ),
-            )
-        )
-
-    # Bytes not owned by a data symbol cannot be safely classified. Ignore only
-    # trailing zero padding; otherwise force an incomplete result with an offset.
-    for name in sorted(set(left_sections) | set(right_sections)):
-        left_section = left_sections.get(name)
-        right_section = right_sections.get(name)
-        if left_section is None or right_section is None:
-            findings.append(Finding("ERROR", "unattributed-data", name, "<missing>" if left_section is None else "<present>", "<missing>" if right_section is None else "<present>"))
-            continue
-        if left_section.type == SHT_NOBITS and right_section.type == SHT_NOBITS:
-            continue
-        left_residual = bytearray(left_elf.section_data(left_section))
-        right_residual = bytearray(right_elf.section_data(right_section))
-        for start, end in left_covered.get(name, []):
-            left_residual[start:end] = b"\0" * (end - start)
-        for start, end in right_covered.get(name, []):
-            right_residual[start:end] = b"\0" * (end - start)
-        left_mapped = _normalize_paths(bytes(left_residual), left_path_maps)
-        right_mapped = _normalize_paths(bytes(right_residual), right_path_maps)
-        left_normalized = left_mapped.rstrip(b"\0")
-        right_normalized = right_mapped.rstrip(b"\0")
-        if left_normalized != right_normalized:
-            left_summary = _unattributed_data_summary(left_mapped)
-            right_summary = _unattributed_data_summary(right_mapped)
-            strings_equal = (
-                left_summary.printable_strings == right_summary.printable_strings
-            )
-            mismatch = next(
-                (index for index, pair in enumerate(zip(left_normalized, right_normalized)) if pair[0] != pair[1]),
-                min(len(left_normalized), len(right_normalized)),
-            )
-            findings.append(
-                Finding(
-                    "ERROR",
-                    "unattributed-data",
-                    name,
-                    left_summary.as_dict(strings_equal),
-                    right_summary.as_dict(strings_equal),
-                    (
-                        "normalized printable string multisets match after path mapping; "
-                        "remaining opaque bytes or layout first differ at section offset "
-                        f"0x{mismatch:x}; cannot safely classify as semantic equality"
-                        if strings_equal
-                        else "normalized printable string multisets differ; unowned data first "
-                        f"differs at section offset 0x{mismatch:x}"
-                    ),
-                )
-            )
-    return findings
-
-
-def explain_section_coverage(
-    elf: Any, ignored_patterns: Sequence[str]
-) -> List[Dict[str, Any]]:
-    """Classify every named section by the build-mode evidence it receives."""
-
-    result: List[Dict[str, Any]] = []
-    direct_reasons = {
-        ".dynamic": "supported dynamic tags and dependency order are compared",
-        ".dynsym": "public imports and exports are compared by stable symbol attributes",
-        ".gnu.version_r": "runtime version providers and maximum version floors are compared",
-    }
-    evidence_names = {
-        ".dynstr",
-        ".strtab",
-        ".symtab",
-        ".gnu.version",
-        ".interp",
-    }
-    intentionally_ignored = {".shstrtab"}
-    known_uncovered = {
-        ".eh_frame",
-        ".eh_frame_hdr",
-        ".gcc_except_table",
-        ".gnu.hash",
-        ".hash",
-        ".gnu.version_d",
-        ".got",
-        ".got.plt",
-    }
-    selected_target_indices = {
-        section.index
-        for section in _selected_data_sections(elf, ignored_patterns).values()
-    }
-    selected_target_indices.update(
-        section.index
-        for section in _initialization_array_sections(
-            elf, ignored_patterns
-        ).values()
-    )
-    consumed_relocation_sections = {
-        relocation.source_section_index
-        for relocation in elf.relocations()
-        if relocation.target_section_index in selected_target_indices
-    }
-    for section in elf.sections:
-        if section.index == 0 or not section.name:
-            continue
-        name = section.name
-        if name == ".comment":
-            classification = "evidence"
-            reason = "compiler strings are compared only for a non-decisive JSON note"
-        elif _matches_any(name, ignored_patterns) or name in intentionally_ignored:
-            classification = "ignored"
-            reason = "build/debug/layout metadata intentionally excluded by policy"
-        elif section.type in {
-            SHT_INIT_ARRAY,
-            SHT_FINI_ARRAY,
-            SHT_PREINIT_ARRAY,
-        }:
-            classification = "compared"
-            reason = "callback count and order are compared; unresolved targets cause incomplete coverage"
-        elif (
-            section.flags & SHF_ALLOC
-            and _matches_any(name, DATA_SECTION_PATTERNS)
-        ):
-            classification = "compared"
-            reason = "selected allocated data is compared by symbol and relocation"
-        elif name == ".note.gnu.property":
-            if elf.machine in (EM_386, EM_X86_64, EM_AARCH64):
-                classification = "compared"
-                reason = "supported GNU property hardening bits are compared directionally"
-            else:
-                classification = "uncovered"
-                reason = "GNU property semantics are not implemented for this architecture"
-        elif name in direct_reasons:
-            classification = "compared"
-            reason = direct_reasons[name]
-        elif name.startswith((".rela", ".rel")):
-            if section.index in consumed_relocation_sections:
-                classification = "evidence"
-                reason = "at least one entry targets selected data or a callback array"
-            else:
-                classification = "uncovered"
-                reason = "no entry is consumed by a current semantic comparison rule"
-        elif name in evidence_names:
-            classification = "evidence"
-            reason = "used to interpret symbols, versions, or runtime metadata"
-        elif _is_plt_section(name):
-            classification = "evidence"
-            reason = "excluded from function presence; loader table is not independently validated"
-        elif section.flags & SHF_EXECINSTR:
-            classification = "compared"
-            reason = "function presence is compared; matched instructions are ignored"
-        elif name in known_uncovered:
-            classification = "uncovered"
-            reason = "not currently normalized into the consistency decision"
-        else:
-            classification = "uncovered"
-            reason = "no current semantic comparison rule"
-        result.append(
-            {
-                "section": name,
-                "index": section.index,
-                "classification": classification,
-                "reason": reason,
-            }
-        )
-    return result
-
-
-def render_coverage_explanation(report: Dict[str, Any]) -> str:
-    lines = [f"Section coverage: {report['artifact']}"]
-    for item in report["sections"]:
-        lines.append(
-            f"  [{item['classification']}] {item['section']} "
-            f"[#{item['index']}]: {item['reason']}"
-        )
-    counts = report["summary"]
-    lines.append(
-        "Summary: "
-        + ", ".join(
-            f"{counts.get(name, 0)} {name}"
-            for name in ("compared", "evidence", "ignored", "uncovered")
-        )
-    )
-    return "\n".join(lines)
-
-
-def _save_output(report_dir: Optional[str], result: CommandResult) -> Optional[str]:
-    if not report_dir:
-        return None
-    os.makedirs(report_dir, exist_ok=True)
-    path = os.path.join(report_dir, result.name.replace("/", "_") + ".txt")
-    with open(path, "w", encoding="utf-8") as stream:
-        stream.write("$ " + shlex.join(result.command) + "\n\n")
-        stream.write(result.stdout)
-        if result.stderr:
-            stream.write("\n[stderr]\n" + result.stderr)
-    return os.path.abspath(path)
-
-
 def _run_readelf(
     runner: ToolRunner, command: Sequence[str], path: str, side: str
 ) -> CommandResult:
@@ -3129,13 +1663,10 @@ def _abidiff_reports_only_export_surface_changes(output: str) -> bool:
 
 def _record_paired_results(
     results: Sequence[CommandResult],
-    executions: List[Dict[str, Any]],
     findings: List[Finding],
-    report_dir: Optional[str],
 ) -> bool:
     succeeded = True
     for result in results:
-        executions.append(result.as_dict(_save_output(report_dir, result)))
         if result.returncode != 0:
             findings.append(_tool_failure(result))
             succeeded = False
@@ -3154,10 +1685,7 @@ def compare_build(
     runner = runner or ToolRunner(args.timeout)
     tools = discover_tools(args)
     findings: List[Finding] = []
-    executions: List[Dict[str, Any]] = []
     missing: List[str] = []
-    if args.report_dir:
-        os.makedirs(args.report_dir, exist_ok=True)
 
     both_dynamic = left_elf.type == 3 and right_elf.type == 3
     has_program_interpreter = any(
@@ -3166,21 +1694,11 @@ def compare_build(
         for program in elf.program_headers
     )
     looks_like_shared_library = both_dynamic and not has_program_interpreter
-    should_check_abi = (
-        "abidiff" in args.require_tool
-        or args.abi == "always"
-        or (args.abi == "auto" and looks_like_shared_library)
-    )
-    skip_function_presence = bool(
-        getattr(args, "skip_function_bodies", False)
-    )
+    should_check_abi = looks_like_shared_library
     required = ["readelf"]
-    if args.level == "deep":
-        required.extend(("elf_diff", "diffoscope"))
     if should_check_abi:
         required.append("abidiff")
-    required.extend(args.require_tool)
-    for name in dict.fromkeys(required):
+    for name in required:
         if tools.get(name) is None:
             missing.append(name)
             findings.append(
@@ -3212,19 +1730,6 @@ def compare_build(
             )
         )
 
-    # These checks do not depend on external tools and always run. When strip
-    # levels differ, use only .dynsym on both sides to keep symbol coverage
-    # symmetric; the strip-profile finding records the lost local coverage.
-    findings.extend(
-        compare_data_sections(
-            left_elf,
-            right_elf,
-            ignored_patterns,
-            left_path_maps=args.left_path_map,
-            right_path_maps=args.right_path_map,
-            dynamic_symbols_only=strip_profile_mismatch,
-        )
-    )
     findings.extend(
         compare_initialization_arrays(
             left_elf,
@@ -3238,7 +1743,7 @@ def compare_build(
         left_readelf = _run_readelf(runner, readelf, left_path, "make")
         right_readelf = _run_readelf(runner, readelf, right_path, "bazel")
         if _record_paired_results(
-            (left_readelf, right_readelf), executions, findings, args.report_dir
+            (left_readelf, right_readelf), findings
         ):
             left_dynamic_symbols = {
                 section.name
@@ -3275,11 +1780,11 @@ def compare_build(
                     compare_contracts(
                         left_contract,
                         right_contract,
-                        allow_extra_needed=args.allow_extra_needed,
-                        allow_needed_reorder=args.allow_needed_reorder,
+                        allow_extra_needed=(),
+                        allow_needed_reorder=False,
                     )
                 )
-            if not skip_function_presence and not strip_profile_mismatch:
+            if not strip_profile_mismatch:
                 left_functions = parse_readelf_function_symbols(
                     left_readelf.stdout, left_elf
                 )
@@ -3318,32 +1823,10 @@ def compare_build(
                         compare_functions(left_functions, right_functions)
                     )
 
-    eu_elfcmp = tools.get("eu-elfcmp")
-    if eu_elfcmp:
-        result = runner.run(
-            "eu-elfcmp",
-            list(eu_elfcmp) + ["--ignore-build-id", "--gaps=ignore", "-l", left_path, right_path],
-        )
-        executions.append(result.as_dict(_save_output(args.report_dir, result)))
-        if result.returncode == 1:
-            findings.append(
-                Finding(
-                    "INFO",
-                    "elf-layout",
-                    "eu-elfcmp",
-                    "make ELF",
-                    "bazel ELF",
-                    (result.stderr or result.stdout).strip()[:4000],
-                )
-            )
-        elif result.returncode not in (0, 1):
-            findings.append(_tool_failure(result))
-
     abidiff = tools.get("abidiff")
     if should_check_abi:
         if abidiff:
             result = runner.run("abidiff", list(abidiff) + [left_path, right_path])
-            executions.append(result.as_dict(_save_output(args.report_dir, result)))
             if result.returncode & 3:
                 findings.append(_tool_failure(result))
             elif result.returncode & 12:
@@ -3373,84 +1856,19 @@ def compare_build(
             # The required-tool pass above already records this as ERROR.
             pass
 
-    run_elf_diff = args.level == "deep" or "elf_diff" in args.require_tool
-    if run_elf_diff and tools.get("elf_diff"):
-        if not args.report_dir:
-            findings.append(Finding("ERROR", "coverage", "elf_diff", "report directory", "missing"))
-        else:
-            elf_diff_json = os.path.join(args.report_dir, "elf_diff.json")
-            result = runner.run(
-                "elf_diff",
-                list(tools["elf_diff"] or []) + ["--json_file", elf_diff_json, left_path, right_path],
-            )
-            executions.append(result.as_dict(_save_output(args.report_dir, result)))
-            if result.returncode != 0:
-                findings.append(_tool_failure(result))
-
-    run_diffoscope = args.level == "deep" or "diffoscope" in args.require_tool
-    if run_diffoscope and tools.get("diffoscope"):
-        if not args.report_dir:
-            findings.append(Finding("ERROR", "coverage", "diffoscope", "report directory", "missing"))
-        else:
-            text_path = os.path.join(args.report_dir, "diffoscope.txt")
-            html_path = os.path.join(args.report_dir, "diffoscope.html")
-            result = runner.run(
-                "diffoscope",
-                list(tools["diffoscope"] or [])
-                + ["--text", text_path, "--html", html_path, left_path, right_path],
-            )
-            executions.append(result.as_dict(_save_output(args.report_dir, result)))
-            if result.returncode not in (0, 1):
-                findings.append(_tool_failure(result))
-
     has_error = bool(missing) or any(item.severity == "ERROR" for item in findings)
     has_failure = any(item.severity == "FAIL" for item in findings)
     if has_failure:
-        status = "DIFFERENT"
         exit_code = EXIT_DIFFERENT
-        equal: Optional[bool] = False
     elif has_error:
-        status = "INCOMPLETE"
         exit_code = EXIT_INCOMPLETE
-        equal = None
     else:
-        status = "CONSISTENT"
         exit_code = EXIT_CONSISTENT
-        equal = True
 
     report = {
-        "mode": "build",
-        "level": args.level,
-        "status": status,
-        "equal": equal,
-        "definition": (
-            "Same runtime contract, supported security properties, selected "
-            "allocated data, and ordered loader callback arrays; function "
-            "presence comparison was explicitly skipped."
-            if skip_function_presence
-            else "Same runtime contract, supported security properties, "
-            "function presence, selected allocated data, and ordered loader "
-            "callback arrays. Matched function instructions are ignored."
-        ),
-        "left": {"role": "make", "path": os.path.abspath(left_path), "sha256": left_elf.sha256},
-        "right": {"role": "bazel", "path": os.path.abspath(right_path), "sha256": right_elf.sha256},
-        "coverage": {
-            "required_tools": list(dict.fromkeys(required)),
-            "missing_tools": missing,
-            "available_tools": sorted(name for name, command in tools.items() if command),
-            "skipped_checks": (
-                ["function-presence"] if skip_function_presence else []
-            ),
-        },
-        "summary": {
-            "fail": sum(item.severity == "FAIL" for item in findings),
-            "warn": sum(item.severity == "WARN" for item in findings),
-            "info": sum(item.severity == "INFO" for item in findings),
-            "error": sum(item.severity == "ERROR" for item in findings),
-        },
-        "groups": [group.as_dict() for group in group_findings(findings)],
+        "make": os.path.abspath(left_path),
+        "bazel": os.path.abspath(right_path),
         "findings": [item.as_dict() for item in findings],
-        "tools": executions,
     }
     compiler_mismatch = compiler_comment_mismatch(left_elf, right_elf)
     if compiler_mismatch:
@@ -3458,63 +1876,10 @@ def compare_build(
     return report, exit_code
 
 
-def group_findings(
-    findings: Sequence[Finding], example_limit: int = 3
-) -> List[FindingGroup]:
-    """Group observable findings without inferring a shared root cause."""
-    grouped: Dict[Tuple[str, str], List[str]] = {}
-    for finding in findings:
-        grouped.setdefault((finding.severity, finding.category), []).append(
-            finding.path
-        )
-    severity_order = {"FAIL": 0, "ERROR": 1, "WARN": 2, "INFO": 3}
-    ordered = sorted(
-        grouped.items(),
-        key=lambda item: (
-            severity_order.get(item[0][0], 4),
-            -len(item[1]),
-            item[0][1],
-        ),
-    )
-    return [
-        FindingGroup(
-            severity=severity,
-            category=category,
-            count=len(paths),
-            examples=tuple(
-                sorted(
-                    {
-                        summarize_finding_path(path, category)
-                        for path in paths
-                    }
-                )[:example_limit]
-            ),
-        )
-        for (severity, category), paths in ordered
-    ]
-
-
-def summarize_finding_path(path: str, category: Optional[str] = None) -> str:
-    """Simplify known compiler-generated data symbols in summaries only."""
-
-    if category != "data-symbol":
-        return path
-    match = re.fullmatch(
-        r"(?P<base>_+PRETTY_FUNCTION_+|__func__|__FUNCTION__)"
-        r"(?:\.\d+)?(?:#\d+)?",
-        path,
-    )
-    return match.group("base") if match else path
-
-
 def is_reportable_finding(finding: Dict[str, Any]) -> bool:
     """Return whether a finding belongs in user-facing reports."""
 
-    category = finding.get("category")
-    return (
-        finding.get("severity") == "FAIL"
-        and category not in OMITTED_REPORT_CATEGORIES
-    )
+    return finding.get("severity") == "FAIL"
 
 
 def _finding_section(
@@ -3536,25 +1901,6 @@ def _finding_section(
         if path.startswith("security.gnu_property."):
             return "<gnu-property-notes>"
         return "<program-headers>"
-    if public_category == "runtime-data":
-        fallback = PUBLIC_CATEGORY_SECTIONS[public_category]
-        left_value = finding.get("left")
-        right_value = finding.get("right")
-        left_section = (
-            left_value.get("section", fallback)
-            if isinstance(left_value, dict)
-            else fallback
-        )
-        right_section = (
-            right_value.get("section", fallback)
-            if isinstance(right_value, dict)
-            else fallback
-        )
-        return (
-            left_section
-            if left_section == right_section
-            else {"make": left_section, "bazel": right_section}
-        )
     return PUBLIC_CATEGORY_SECTIONS[public_category]
 
 
@@ -3609,90 +1955,6 @@ def report_for_output(report: Dict[str, Any]) -> Dict[str, Any]:
             public_findings.append(finding)
     public["findings"] = public_findings
     return public
-
-
-def _human_finding_value(category: str, value: Any) -> str:
-    if category == "data-relocation-coverage" and isinstance(value, dict):
-        summarized = dict(value)
-        for key, label in (
-            ("relocations", "relocation(s)"),
-            ("resolved_relocations", "resolved relocation(s)"),
-            ("unresolved_relocations", "unresolved relocation(s)"),
-            ("unsupported_relocations", "unsupported relocation(s)"),
-        ):
-            entries = summarized.get(key)
-            if isinstance(entries, (list, tuple)):
-                summarized[key] = f"{len(entries)} {label}"
-        return str(summarized)
-    return str(value)
-
-
-def render_build_text(report: Dict[str, Any], max_differences: int) -> str:
-    lines = [
-        f"Result: {report['status']} (mode: build, level: {report['level']})",
-        f"Make : {report['left']['path']}",
-        f"Bazel: {report['right']['path']}",
-    ]
-    coverage = report["coverage"]
-    lines.append("Tools: " + (", ".join(coverage["available_tools"]) or "none"))
-    if coverage["missing_tools"]:
-        lines.append("Missing required tools: " + ", ".join(coverage["missing_tools"]))
-    if coverage.get("skipped_checks"):
-        lines.append("Skipped checks: " + ", ".join(coverage["skipped_checks"]))
-
-    count_label = "Semantic differences"
-    group_label = "Semantic difference groups:"
-    ordered = []
-    for item in report["findings"]:
-        finding = finding_for_output(item)
-        if finding is not None:
-            ordered.append(finding)
-    if ordered:
-        lines.append(f"{count_label}: {len(ordered)}")
-        grouped_paths: Dict[str, List[str]] = {}
-        for item in ordered:
-            grouped_paths.setdefault(item["category"], []).append(item["path"])
-        groups = [
-            FindingGroup(
-                severity="FAIL",
-                category=category,
-                count=len(paths),
-                examples=tuple(sorted(set(paths))[:3]),
-            )
-            for category, paths in sorted(grouped_paths.items())
-        ]
-        if groups:
-            lines.append(group_label)
-            for group in groups:
-                examples = group.displayed_examples()
-                suffix = f"; examples: {examples}" if examples else ""
-                lines.append(
-                    f"  - [{group.category}] {group.count}{suffix}"
-                )
-        for item in ordered[:max_differences]:
-            left_value = _human_finding_value(item["category"], item["left"])
-            right_value = _human_finding_value(
-                item["category"], item["right"]
-            )
-            lines.append(
-                f"  - [{item['category']}] {item['path']}: "
-                f"{left_value} -> {right_value}"
-            )
-            if item.get("detail"):
-                detail_lines = str(item["detail"]).splitlines()
-                lines.extend("      " + detail for detail in detail_lines[:12])
-                if len(detail_lines) > 12:
-                    lines.append(f"      ... {len(detail_lines) - 12} more line(s)")
-        omitted = len(ordered) - max_differences
-        if omitted > 0:
-            lines.append(
-                f"  ... {omitted} more item(s)"
-            )
-    else:
-        lines.append(f"{count_label}: none")
-    if report.get("report_dir"):
-        lines.append("Reports: " + report["report_dir"])
-    return "\n".join(lines)
 
 
 def dump_json(report: Dict[str, Any]) -> str:
