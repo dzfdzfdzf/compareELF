@@ -79,42 +79,28 @@ When differences are found:
 | `compiler_version_mismatch` | Optional `.comment` compiler/assembler strings; explanatory only and not a semantic failure by itself |
 | `findings` | Confirmed semantic differences |
 | `category` | Difference category |
-| `section` | Primary ELF evidence location; the dynamic table is reported as `.dynamic` |
+| `section` | Primary ELF evidence location; |
 | `name` | Changed property, symbol, function, or callback |
 | `left` | Make-side value |
 | `right` | Bazel-side value |
 | `detail` | Optional explanation |
 
-`left` always means Make and `right` always means Bazel.
 
 ## Categories
 
 | Category | Meaning |
 |---|---|
 | `elf` | Base ELF contract changed, such as Class, Data, Machine, Type, OS/ABI, ABI Version, or Flags |
-| `runtime` | Loader or TLS runtime contract changed, such as the program interpreter or TLS properties |
 | `dependency` | `.dynamic` dependencies, SONAME, RPATH, RUNPATH, or dynamic flags changed |
 | `import-added` | Bazel adds a dynamic imported symbol and therefore a runtime symbol dependency |
-| `import-removed` | A Make dynamic import is absent from Bazel; changes involving `*_chk` or `__stack_chk_fail` remain import findings and are not duplicated as security findings |
+| `import-removed` | A Make dynamic import is absent from Bazel |
 | `import-changed` | Type, binding, visibility, or versioned identity of a dynamic import changed |
-| `export-added` | Bazel adds a non-WEAK dynamic export |
+| `export-added` | Bazel adds a  dynamic export |
 | `export-removed` | A dynamic export provided by Make is absent from Bazel |
 | `export-changed` | Type, binding, visibility, definition state, or object size of a dynamic export changed |
 | `runtime-version` | Bazel raises or adds a runtime symbol-version requirement, for example from `GLIBC_2.17` to `GLIBC_2.38` |
-| `function-added` | An ordinary non-WEAK function identifiable by `readelf -sW` exists only in Bazel |
+| `function-added` | An ordinary  function identifiable by `readelf -sW` exists only in Bazel |
 | `function-removed` | An ordinary function identifiable by `readelf -sW` exists only in Make |
 | `startup-callback` | Callback count, identity, or order differs in `.preinit_array`, `.init_array`, or `.fini_array` |
-| `runtime-data` | Runtime data included in semantic comparison differs |
-| `security` | A direct hardening property regressed or changed ambiguously, such as BIND_NOW, GNU_STACK, RELRO, IBT, SHSTK, BTI, or PAC |
 | `abi` | `abidiff` reports a function-signature or structure/class layout change; pure export additions/removals are not duplicated here |
 
-## Exit Codes
-
-| Code | Meaning |
-|---:|---|
-| `0` | Completed checks found no semantic difference |
-| `1` | A semantic difference was found |
-| `2` | An input cannot be read, is invalid, or is not a supported ELF |
-| `3` | A required tool failed or evidence is insufficient, including asymmetric stripping |
-
-CI should reject both exit code `1` and exit code `3`.
